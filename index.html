@@ -414,7 +414,7 @@ function renderBillRow(b){
     <td class="mono">${b.submittedDate}</td>
     <td><span class="badge ${b.status}">${b.status}</span>${b.remark?`<br><span style="font-size:11px;color:var(--ink-soft);">${b.remark}</span>`:''}</td>
     <td class="${delayClass}">${delayDays}d</td>
-    <td>${b.photoUrl?`<img class="photo-thumb" data-photo-url="${b.photoUrl}" src="${b.photoUrl}" alt="bill">`:'&mdash;'}</td>
+    <td>${b.photoFileId?`<img class="photo-thumb" data-photo-id="${b.photoFileId}" data-photo-mime="${b.photoMime||''}" data-photo-preview="${b.photoPreviewUrl}" data-photo-open="${b.photoOpenUrl}" src="${b.photoThumbUrl}" alt="bill">`:'&mdash;'}</td>
   </tr>`;
 }
 
@@ -439,7 +439,7 @@ function renderFinanceQueue(){
       <td>${b.title}${b.billNo?`<br><span class="mono" style="font-size:11px;color:var(--ink-soft);">${b.billNo}</span>`:''}</td>
       <td class="mono">${fmtINR(b.amount)}</td><td class="mono">${b.submittedDate}</td>
       <td class="${delayClass}">${delayDays}d</td><td><span class="badge ${b.status}">${b.status}</span></td>
-      <td>${b.photoUrl?`<img class="photo-thumb" data-photo-url="${b.photoUrl}" src="${b.photoUrl}" alt="bill">`:'&mdash;'}</td>
+      <td>${b.photoFileId?`<img class="photo-thumb" data-photo-id="${b.photoFileId}" data-photo-mime="${b.photoMime||''}" data-photo-preview="${b.photoPreviewUrl}" data-photo-open="${b.photoOpenUrl}" src="${b.photoThumbUrl}" alt="bill">`:'&mdash;'}</td>
       <td><select data-status-vertical="${b.vertical}" data-status-bill="${b.id}" class="finance-status-select">
         ${["Pending","Approved","Rejected","Query"].map(s=>`<option ${s===b.status?'selected':''}>${s}</option>`).join('')}
       </select></td>
@@ -483,10 +483,16 @@ function renderDashboard(){
 }
 
 function renderPhotoModal(){
+  const p = STATE.photoModal || {};
+  const isImage = (p.mime||'').indexOf('image/') === 0;
+  const body = isImage
+    ? `<img src="https://drive.google.com/thumbnail?id=${p.id}&sz=w1600" alt="Bill attachment">`
+    : `<iframe src="${p.preview}" style="width:100%;height:70vh;border:1px solid var(--paper-line);border-radius:8px;margin-top:10px;" allow="autoplay"></iframe>`;
   return `<div class="modal-bg" id="modal-bg"><div class="modal">
     <button class="close" id="modal-close">&times;</button>
-    <b>Bill photograph</b>
-    <img src="${STATE.photoModal}">
+    <b>Bill attachment</b>
+    ${body}
+    <p style="margin-top:10px;"><a href="${p.open}" target="_blank" rel="noopener" class="mono" style="font-size:12.5px;color:var(--navy);">Open original in Google Drive &rarr;</a></p>
   </div></div>`;
 }
 
@@ -564,6 +570,9 @@ function bindEvents(){
     const details = document.getElementById('in-bill-details').value.trim();
     const fileInput = document.getElementById('in-bill-photo');
     if(!title || !amt || !billDate){ STATE.loginError = "Please fill in title, amount and bill date."; render(); return; }
+    if(fileInput.files && fileInput.files[0] && fileInput.files[0].size > 5*1024*1024){
+      STATE.loginError = "Photo/PDF is larger than 5 MB. Please upload a smaller file."; render(); return;
+    }
     const head = STATE.data[v].heads.find(h=>h.id===headId);
     STATE.loginError=""; STATE.busy = true; render();
 
@@ -597,8 +606,16 @@ function bindEvents(){
   });
   on('sel-finance-filter','change', e=>{ STATE.dashboardFilter = e.target.value; render(); });
 
-  document.querySelectorAll('[data-photo-url]').forEach(img=>{
-    img.addEventListener('click', ()=>{ STATE.photoModal = img.getAttribute('data-photo-url'); render(); });
+  document.querySelectorAll('[data-photo-id]').forEach(img=>{
+    img.addEventListener('click', ()=>{
+      STATE.photoModal = {
+        id: img.getAttribute('data-photo-id'),
+        mime: img.getAttribute('data-photo-mime'),
+        preview: img.getAttribute('data-photo-preview'),
+        open: img.getAttribute('data-photo-open')
+      };
+      render();
+    });
   });
   on('modal-close','click', ()=>{ STATE.photoModal=null; render(); });
   on('modal-bg','click', (e)=>{ if(e.target.id==='modal-bg'){ STATE.photoModal=null; render(); } });
