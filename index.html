@@ -6,6 +6,7 @@
 <title>TRLM SMMU &mdash; Bill Tracker</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Tiro+Bangla:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 <style>
   :root{
     --navy:#12305C; --navy-deep:#0B2246; --gold:#E0A93A; --gold-soft:#F3D9A0;
@@ -90,7 +91,7 @@
   .section-title{display:flex; align-items:baseline; gap:10px; margin:26px 0 14px;}
   .section-title h3{font-family:'Tiro Bangla',serif; font-size:21px; color:var(--navy-deep); margin:0;}
   .section-title .rule{flex:1; height:1px; background:var(--paper-line);}
-  .kpi-row{display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:6px;}
+  .kpi-row{display:grid; grid-template-columns:repeat(5,1fr); gap:14px; margin-bottom:6px;}
   @media (max-width:760px){.kpi-row{grid-template-columns:repeat(2,1fr);}}
   .kpi{
     background:var(--card); border:1px solid var(--paper-line); border-radius:var(--radius); padding:16px 18px;
@@ -111,6 +112,17 @@
   .badge.Approved{background:#dcf0e1; color:var(--ok);}
   .badge.Rejected{background:#f7dcdc; color:var(--red);}
   .badge.Query{background:#e1e6f5; color:#3a4bb2;}
+  .badge.st-pending{background:#fbe9cf; color:var(--amber);}
+  .badge.st-approved{background:#dcf0e1; color:var(--ok);}
+  .badge.st-rejected{background:#f7dcdc; color:var(--red);}
+  .badge.st-query{background:#e1e6f5; color:#3a4bb2;}
+  .badge.st-process{background:#fde3d0; color:var(--saffron);}
+  .badge.st-completed{background:#c9e9d4; color:var(--green); font-weight:800;}
+  .note-link{font-size:11px; color:var(--red); text-decoration:underline; cursor:pointer; margin-left:6px; font-weight:700; display:inline-block;}
+  .chart-card{background:var(--card); border:1px solid var(--paper-line); border-radius:var(--radius); box-shadow:var(--shadow); padding:18px; margin-bottom:18px;}
+  .chart-card canvas{max-width:100%;}
+  .chart-row{display:grid; grid-template-columns:1.2fr .8fr; gap:18px;}
+  @media (max-width:900px){.chart-row{grid-template-columns:1fr;}}
   .delay-ok{color:var(--ok); font-weight:600;}
   .delay-warn{color:var(--amber); font-weight:700;}
   .delay-bad{color:var(--red); font-weight:700;}
@@ -158,10 +170,58 @@ const VERTICALS = ["HR","IBCB","SISD","Gender","FNHW","PRI-CBO","SAY","Financial
 const FINANCE_VERTICAL = "Finance";
 const CONFIGURED = API_URL.indexOf("PASTE_YOUR") === -1;
 
+// ----- Bill status pipeline (Finance-controlled) -----
+const STATUS_LIST = [
+  "Pending",
+  "Approved for Sanction",
+  "Approved for under process",
+  "Rejected",
+  "Query",
+  "Payment under process - At Gramnidhi",
+  "Payment under process - At Sparsh",
+  "Payment under process - At DDO Login",
+  "Payment under process - At Treasury",
+  "Payment under process - At Cyber Treasury",
+  "Payment under process - At PD (Ministry)",
+  "Payment under process - At RBI",
+  "Payment Completed"
+];
+const STATUSES_NEEDING_REMARK = ["Rejected", "Query"];
+const TERMINAL_COMPLETE_STATUS = "Payment Completed";
+
+// Buckets each status into one of 6 groups, used for badge colour + dashboard analytics
+function statusGroup(status){
+  if(status === "Pending") return "pending";
+  if(status === "Approved for Sanction" || status === "Approved for under process") return "approved";
+  if(status === "Rejected") return "rejected";
+  if(status === "Query") return "query";
+  if(status === TERMINAL_COMPLETE_STATUS) return "completed";
+  if((status||"").indexOf("Payment under process") === 0) return "process";
+  return "pending";
+}
+function statusClass(status){ return "st-" + statusGroup(status); }
+function statusShortLabel(status){
+  const map = {
+    "Approved for Sanction":"Approved (Sanction)",
+    "Approved for under process":"Approved (Processing)",
+    "Payment under process - At Gramnidhi":"In Process: Gramnidhi",
+    "Payment under process - At Sparsh":"In Process: Sparsh",
+    "Payment under process - At DDO Login":"In Process: DDO Login",
+    "Payment under process - At Treasury":"In Process: Treasury",
+    "Payment under process - At Cyber Treasury":"In Process: Cyber Treasury",
+    "Payment under process - At PD (Ministry)":"In Process: PD (Ministry)",
+    "Payment under process - At RBI":"In Process: RBI",
+    "Payment Completed":"Payment Completed"
+  };
+  return map[status] || status;
+}
+function escapeAttr(s){ return String(s||"").replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+
 let STATE = {
   loading: true, data: {}, loggedInVertical: null, view: "landing",
   loginSelect: VERTICALS[0], loginError: "", newPassword: "", newPasswordConfirm: "",
   photoModal: null, dashboardFilter: "All", toast: null, busy:false,
+  remarksModal: null, headsChartVertical: null,
 };
 
 ///////////////////////// API HELPERS /////////////////////////
@@ -206,7 +266,79 @@ function showToast(msg, isErr){
 function todayISO(){ return new Date().toISOString().slice(0,10); }
 function daysBetween(d1,d2){ const a=new Date(d1), b=new Date(d2); return Math.floor((b-a)/86400000); }
 function fmtINR(n){ n = Number(n)||0; return "\u20B9"+n.toLocaleString('en-IN'); }
+///////////////////////// CHARTS /////////////////////////
+let CHART_INSTANCES = {};
+function destroyCharts(){
+  Object.values(CHART_INSTANCES).forEach(c=>{ if(c) c.destroy(); });
+  CHART_INSTANCES = {};
+}
+function renderCharts(){
+  if(typeof Chart === 'undefined') return; // offline / CDN blocked — page still works fine otherwise
 
+  // Chart 1: total allocated Head-of-Account budget, per vertical
+  const headTotals = VERTICALS.map(v=> (STATE.data[v].heads||[]).reduce((s,h)=>s+Number(h.allocated||0),0));
+  const ctx1 = document.getElementById('chart-heads');
+  if(ctx1){
+    CHART_INSTANCES.heads = new Chart(ctx1, {
+      type:'bar',
+      data:{ labels: VERTICALS, datasets:[{ label:'Allocated (\u20B9)', data: headTotals, backgroundColor:'#12305C' }] },
+      options:{ responsive:true, plugins:{legend:{display:false}},
+        scales:{ x:{ ticks:{ maxRotation:70, minRotation:70, font:{size:10} } }, y:{ beginAtZero:true } } }
+    });
+  }
+
+  // Chart 2: heads-of-account breakdown for one chosen vertical
+  const selVertical = STATE.headsChartVertical || VERTICALS[0];
+  const heads = (STATE.data[selVertical] && STATE.data[selVertical].heads) || [];
+  const ctx2 = document.getElementById('chart-heads-detail');
+  if(ctx2){
+    CHART_INSTANCES.headsDetail = new Chart(ctx2, {
+      type:'doughnut',
+      data:{ labels: heads.map(h=>h.name), datasets:[{ data: heads.map(h=>Number(h.allocated||0)),
+        backgroundColor:['#12305C','#D9662B','#146B3A','#E0A93A','#3a4bb2','#B23A3A','#5B5A50','#6b4b06','#0B2246','#c6821f'] }] },
+      options:{ responsive:true, plugins:{legend:{position:'bottom', labels:{boxWidth:11, font:{size:10.5}}}} }
+    });
+  }
+
+  // Chart 3: bill VALUE by pipeline stage, per vertical (stacked)
+  const buckets = ['pending','approved','process','flagged','completed'];
+  const bucketLabels = {pending:'Pending review', approved:'Approved (awaiting payment start)',
+    process:'In payment process', flagged:'Rejected / Query', completed:'Payment completed'};
+  const bucketColors = {pending:'#C6821F', approved:'#146B3A', process:'#D9662B', flagged:'#B23A3A', completed:'#1E7A46'};
+  const perVerticalAmt = VERTICALS.map(v=>{
+    const sums = {pending:0, approved:0, process:0, flagged:0, completed:0};
+    (STATE.data[v].bills||[]).forEach(b=>{
+      const g = statusGroup(b.status);
+      const key = (g==='rejected'||g==='query') ? 'flagged' : g;
+      sums[key] = (sums[key]||0) + Number(b.amount||0);
+    });
+    return sums;
+  });
+  const ctx3 = document.getElementById('chart-expenditure');
+  if(ctx3){
+    CHART_INSTANCES.expenditure = new Chart(ctx3, {
+      type:'bar',
+      data:{ labels: VERTICALS, datasets: buckets.map(bk=>({ label: bucketLabels[bk],
+        data: perVerticalAmt.map(s=>s[bk]), backgroundColor: bucketColors[bk] })) },
+      options:{ responsive:true,
+        scales:{ x:{ stacked:true, ticks:{maxRotation:70,minRotation:70,font:{size:10}} }, y:{ stacked:true, beginAtZero:true } },
+        plugins:{ legend:{ position:'bottom', labels:{boxWidth:11, font:{size:10.5}} } } }
+    });
+  }
+
+  // Chart 4: overall pipeline split, all verticals combined
+  const overall = {pending:0, approved:0, process:0, flagged:0, completed:0};
+  perVerticalAmt.forEach(s=>{ buckets.forEach(bk=> overall[bk]+=s[bk]); });
+  const ctx4 = document.getElementById('chart-overall-pipeline');
+  if(ctx4){
+    CHART_INSTANCES.overall = new Chart(ctx4, {
+      type:'pie',
+      data:{ labels: buckets.map(bk=>bucketLabels[bk]), datasets:[{ data: buckets.map(bk=>overall[bk]),
+        backgroundColor: buckets.map(bk=>bucketColors[bk]) }] },
+      options:{ responsive:true, plugins:{legend:{position:'bottom', labels:{boxWidth:11, font:{size:10.5}}}} }
+    });
+  }
+}
 ///////////////////////// INIT /////////////////////////
 async function init(){
   STATE.data = await loadData();
@@ -238,8 +370,11 @@ function render(){
       font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.25);z-index:300;">${STATE.toast.msg}</div>`;
   }
   if(STATE.photoModal) body += renderPhotoModal();
+  if(STATE.remarksModal) body += renderRemarksModal();
   app.innerHTML = body;
   bindEvents();
+  destroyCharts();
+  if(document.getElementById('chart-heads')) renderCharts();
 }
 
 function renderLanding(){
@@ -405,15 +540,22 @@ function renderMyBills(){
 }
 
 function renderBillRow(b){
-  const delayDays = b.status==='Pending' ? daysBetween(b.submittedDate, todayISO()) : daysBetween(b.submittedDate, b.statusDate||todayISO());
+  const isDone = b.status === TERMINAL_COMPLETE_STATUS;
+  const delayDays = (b.status==='Pending' || !isDone) && b.status!=='Rejected'
+    ? daysBetween(b.submittedDate, isDone ? (b.statusDate||todayISO()) : todayISO())
+    : daysBetween(b.submittedDate, b.statusDate||todayISO());
   let delayClass = 'delay-ok';
   if(delayDays>15) delayClass='delay-bad'; else if(delayDays>7) delayClass='delay-warn';
+  const grp = statusGroup(b.status);
+  const showNote = (grp==='rejected' || grp==='query') && b.remark;
   return `<tr>
     <td><b>${b.title}</b>${b.billNo?`<br><span class="mono" style="font-size:11px;color:var(--ink-soft);">${b.billNo}</span>`:''}</td>
     <td>${b.headName}</td><td class="mono">${fmtINR(b.amount)}</td><td class="mono">${b.billDate}</td>
     <td class="mono">${b.submittedDate}</td>
-    <td><span class="badge ${b.status}">${b.status}</span>${b.remark?`<br><span style="font-size:11px;color:var(--ink-soft);">${b.remark}</span>`:''}</td>
-    <td class="${delayClass}">${delayDays}d</td>
+    <td><span class="badge ${statusClass(b.status)}">${statusShortLabel(b.status)}</span>
+      ${showNote?`<div><span class="note-link" data-remark-view data-remark-status="${b.status}" data-remark-text="${escapeAttr(b.remark)}" data-remark-title="${escapeAttr(b.title)}">view note &rarr;</span></div>`:''}
+    </td>
+    <td class="${isDone?'':delayClass}">${isDone ? 'closed' : delayDays+'d'}</td>
     <td>${b.photoFileId?`<img class="photo-thumb" data-photo-id="${b.photoFileId}" data-photo-mime="${b.photoMime||''}" data-photo-preview="${b.photoPreviewUrl}" data-photo-open="${b.photoOpenUrl}" src="${b.photoThumbUrl}" alt="bill">`:'&mdash;'}</td>
   </tr>`;
 }
@@ -427,21 +569,27 @@ function renderFinanceQueue(){
   return `
   <div class="section-title"><h3>Finance Queue</h3><div class="rule"></div></div>
   <div class="filter-bar"><span style="font-size:12.5px;color:var(--ink-soft);">Filter:</span>
-    <select id="sel-finance-filter">${["All","Pending","Approved","Rejected","Query"].map(s=>`<option ${s===filter?'selected':''}>${s}</option>`).join('')}</select>
+    <select id="sel-finance-filter">${["All",...STATUS_LIST].map(s=>`<option ${s===filter?'selected':''}>${s}</option>`).join('')}</select>
   </div>
   ${filtered.length===0 ? `<div class="card-box empty">No bills in this filter.</div>` : `
-  <table><thead><tr><th>Vertical</th><th>Title</th><th>Amount</th><th>Submitted</th><th>Delay</th><th>Status</th><th>Photo</th><th>Action</th></tr></thead>
+  <table><thead><tr><th>Vertical</th><th>Title</th><th>Amount</th><th>Submitted</th><th>Delay</th><th>Status</th><th>Photo</th><th>Update status</th></tr></thead>
   <tbody>${filtered.map(b=>{
-    const delayDays = b.status==='Pending' ? daysBetween(b.submittedDate, todayISO()) : daysBetween(b.submittedDate, b.statusDate||todayISO());
+    const isDone = b.status === TERMINAL_COMPLETE_STATUS;
+    const delayDays = daysBetween(b.submittedDate, isDone ? (b.statusDate||todayISO()) : todayISO());
     let delayClass = 'delay-ok'; if(delayDays>15) delayClass='delay-bad'; else if(delayDays>7) delayClass='delay-warn';
+    const grp = statusGroup(b.status);
+    const showNote = (grp==='rejected' || grp==='query') && b.remark;
     return `<tr>
       <td><b>${b.vertical}</b></td>
       <td>${b.title}${b.billNo?`<br><span class="mono" style="font-size:11px;color:var(--ink-soft);">${b.billNo}</span>`:''}</td>
       <td class="mono">${fmtINR(b.amount)}</td><td class="mono">${b.submittedDate}</td>
-      <td class="${delayClass}">${delayDays}d</td><td><span class="badge ${b.status}">${b.status}</span></td>
+      <td class="${isDone?'':delayClass}">${isDone?'closed':delayDays+'d'}</td>
+      <td><span class="badge ${statusClass(b.status)}">${statusShortLabel(b.status)}</span>
+        ${showNote?`<div><span class="note-link" data-remark-view data-remark-status="${b.status}" data-remark-text="${escapeAttr(b.remark)}" data-remark-title="${escapeAttr(b.title)}">view note &rarr;</span></div>`:''}
+      </td>
       <td>${b.photoFileId?`<img class="photo-thumb" data-photo-id="${b.photoFileId}" data-photo-mime="${b.photoMime||''}" data-photo-preview="${b.photoPreviewUrl}" data-photo-open="${b.photoOpenUrl}" src="${b.photoThumbUrl}" alt="bill">`:'&mdash;'}</td>
-      <td><select data-status-vertical="${b.vertical}" data-status-bill="${b.id}" class="finance-status-select">
-        ${["Pending","Approved","Rejected","Query"].map(s=>`<option ${s===b.status?'selected':''}>${s}</option>`).join('')}
+      <td><select data-status-vertical="${b.vertical}" data-status-bill="${b.id}" data-old-status="${b.status}" class="finance-status-select">
+        ${STATUS_LIST.map(s=>`<option value="${escapeAttr(s)}" ${s===b.status?'selected':''}>${s}</option>`).join('')}
       </select></td>
     </tr>`;
   }).join('')}</tbody></table>`}`;
@@ -451,35 +599,74 @@ function renderDashboard(){
   let all = [];
   VERTICALS.forEach(v=>{ STATE.data[v].bills.forEach(b=> all.push({...b, vertical:v})); });
   const total = all.length;
-  const pending = all.filter(b=>b.status==='Pending').length;
-  const approved = all.filter(b=>b.status==='Approved').length;
-  const rejected = all.filter(b=>b.status==='Rejected'||b.status==='Query').length;
-  const pendingAmt = all.filter(b=>b.status==='Pending').reduce((s,b)=>s+Number(b.amount||0),0);
+
+  const grouped = {pending:0, approved:0, process:0, completed:0, flagged:0};
+  all.forEach(b=>{
+    const g = statusGroup(b.status);
+    if(g==='rejected' || g==='query') grouped.flagged++; else grouped[g] = (grouped[g]||0)+1;
+  });
+
+  const pipelineAmt = all
+    .filter(b=> statusGroup(b.status) !== 'completed' && statusGroup(b.status) !== 'rejected')
+    .reduce((s,b)=>s+Number(b.amount||0),0);
+
   const perVertical = VERTICALS.map(v=>{
     const bills = STATE.data[v].bills;
-    const vPending = bills.filter(b=>b.status==='Pending');
-    const maxDelay = vPending.length ? Math.max(...vPending.map(b=>daysBetween(b.submittedDate, todayISO()))) : 0;
+    const openBills = bills.filter(b=> statusGroup(b.status) !== 'completed' && statusGroup(b.status) !== 'rejected');
+    const maxDelay = openBills.length ? Math.max(...openBills.map(b=>daysBetween(b.submittedDate, todayISO()))) : 0;
     const lastActivity = bills.length ? bills.map(b=>b.submittedDate).sort().slice(-1)[0] : "&mdash;";
-    return {v, count: bills.length, pending: vPending.length, maxDelay, lastActivity};
+    return {v, count: bills.length, open: openBills.length, maxDelay, lastActivity};
   });
+
   return `
   <div class="section-title"><h3>Programme Dashboard</h3><div class="rule"></div></div>
   <div class="kpi-row">
     <div class="kpi"><div class="num">${total}</div><div class="lbl">Total bills logged</div></div>
-    <div class="kpi pending"><div class="num">${pending}</div><div class="lbl">Pending at Finance</div></div>
-    <div class="kpi approved"><div class="num">${approved}</div><div class="lbl">Approved</div></div>
-    <div class="kpi rejected"><div class="num">${rejected}</div><div class="lbl">Rejected / Query</div></div>
+    <div class="kpi pending"><div class="num">${grouped.pending}</div><div class="lbl">Pending / not yet reviewed</div></div>
+    <div class="kpi" style="border-left-color:var(--saffron);"><div class="num">${grouped.approved+grouped.process}</div><div class="lbl">Approved / in payment process</div></div>
+    <div class="kpi approved"><div class="num">${grouped.completed}</div><div class="lbl">Payment completed</div></div>
+    <div class="kpi rejected"><div class="num">${grouped.flagged}</div><div class="lbl">Rejected / Query</div></div>
   </div>
-  <p style="font-size:12.5px;color:var(--ink-soft);margin:14px 2px 0;">Pending value across all verticals: <b class="mono">${fmtINR(pendingAmt)}</b></p>
+  <p style="font-size:12.5px;color:var(--ink-soft);margin:14px 2px 0;">Value still moving through the pipeline (everything short of Payment Completed, excluding Rejected): <b class="mono">${fmtINR(pipelineAmt)}</b></p>
+
   <div class="section-title"><h3>Vertical-wise status &amp; delay</h3><div class="rule"></div></div>
-  <table><thead><tr><th>Vertical</th><th>Bills logged</th><th>Pending</th><th>Longest pending delay</th><th>Last activity</th></tr></thead>
+  <table><thead><tr><th>Vertical</th><th>Bills logged</th><th>Still in pipeline</th><th>Longest pipeline delay</th><th>Last activity</th></tr></thead>
   <tbody>${perVertical.map(r=>{
     let delayClass='delay-ok'; if(r.maxDelay>15) delayClass='delay-bad'; else if(r.maxDelay>7) delayClass='delay-warn';
-    return `<tr><td><b>${r.v}</b></td><td class="mono">${r.count}</td><td class="mono">${r.pending}</td>
-      <td class="${delayClass}">${r.pending? r.maxDelay+'d' : '&mdash;'}</td><td class="mono">${r.lastActivity}</td></tr>`;
+    return `<tr><td><b>${r.v}</b></td><td class="mono">${r.count}</td><td class="mono">${r.open}</td>
+      <td class="${delayClass}">${r.open? r.maxDelay+'d' : '&mdash;'}</td><td class="mono">${r.lastActivity}</td></tr>`;
   }).join('')}</tbody></table>
-  <div class="footnote">Delay is measured in calendar days from the date a bill was submitted to today (if still pending)
-  or to the date Finance last updated its status. 0&ndash;7 days is shown in green, 8&ndash;15 in amber, and 16+ in red.</div>`;
+
+  <div class="section-title"><h3>Heads of Account &mdash; allocation across verticals</h3><div class="rule"></div></div>
+  <div class="chart-row">
+    <div class="chart-card">
+      <b style="font-size:13px;">Total allocated budget by vertical</b>
+      <canvas id="chart-heads" height="240" style="margin-top:8px;"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="flex-between" style="margin-bottom:8px;">
+        <b style="font-size:13px;">Head-wise split for</b>
+        <select id="sel-heads-vertical" style="width:auto;">
+          ${VERTICALS.map(v=>`<option ${v===(STATE.headsChartVertical||VERTICALS[0])?'selected':''}>${v}</option>`).join('')}
+        </select>
+      </div>
+      <canvas id="chart-heads-detail" height="240"></canvas>
+    </div>
+  </div>
+
+  <div class="section-title"><h3>Expenditure pipeline &mdash; bill value by stage, per vertical</h3><div class="rule"></div></div>
+  <p style="color:var(--ink-soft);font-size:12.5px;max-width:760px;">Every submitted bill is tracked here by amount until it reaches
+  <b>Payment Completed</b>. Bars show how much value sits at each stage &mdash; pending review, approved, moving through the
+  payment chain (Gramnidhi &rarr; Sparsh &rarr; DDO Login &rarr; Treasury &rarr; Cyber Treasury &rarr; PD (Ministry) &rarr; RBI), flagged, or paid out.</p>
+  <div class="chart-row">
+    <div class="chart-card"><canvas id="chart-expenditure" height="260"></canvas></div>
+    <div class="chart-card"><canvas id="chart-overall-pipeline" height="260"></canvas></div>
+  </div>
+
+  <div class="footnote">Delay is measured in calendar days from the date a bill was submitted to today (if still in the
+  pipeline) or to the date Finance last updated its status (once it reaches Payment Completed). 0&ndash;7 days is shown in
+  green, 8&ndash;15 in amber, and 16+ in red. Charts need an internet connection to load (they pull a small charting
+  library from a CDN) &mdash; everything else on this page works offline against your saved data.</div>`;
 }
 
 function renderPhotoModal(){
@@ -495,7 +682,36 @@ function renderPhotoModal(){
     <p style="margin-top:10px;"><a href="${p.open}" target="_blank" rel="noopener" class="mono" style="font-size:12.5px;color:var(--navy);">Open original in Google Drive &rarr;</a></p>
   </div></div>`;
 }
+function renderRemarksModal(){
+  const m = STATE.remarksModal;
+  if(m.mode === 'view'){
+    return `<div class="modal-bg" id="remarks-modal-bg"><div class="modal" style="max-width:460px;">
+      <button class="close" id="remarks-modal-close">&times;</button>
+      <b>${statusShortLabel(m.status)}</b>
+      <p style="font-size:12.5px;color:var(--ink-soft);margin:2px 0 12px;">${m.title||''}</p>
+      <div style="background:#faf6ea;border:1px solid var(--paper-line);border-radius:8px;padding:12px 14px;font-size:13.5px;white-space:pre-wrap;">${m.text || 'No remark was recorded.'}</div>
+    </div></div>`;
+  }
+  return `<div class="modal-bg" id="remarks-modal-bg"><div class="modal" style="max-width:460px;">
+    <button class="close" id="remarks-modal-close">&times;</button>
+    <b>Marking bill as &ldquo;${m.status}&rdquo;</b>
+    <p style="font-size:12.5px;color:var(--ink-soft);margin:4px 0 10px;">Please add a short remark for the concerned vertical &mdash; this will be shown to them against this bill.</p>
+    <textarea id="in-remark-text" rows="4" placeholder="e.g. Bill copy is unclear, please re-upload with GST details visible."></textarea>
+    <div style="display:flex;gap:10px;margin-top:12px;">
+      <button class="btn" id="btn-remark-save" ${STATE.busy?'disabled':''}>${STATE.busy?'Saving…':'Save & update status'}</button>
+      <button class="btn ghost" id="btn-remark-cancel">Cancel</button>
+    </div>
+  </div></div>`;
+}
 
+async function applyStatusChange(billId, status, remark){
+  STATE.busy = true; render();
+  await apiPost("updateBillStatus", {billId, status, remark: remark||""});
+  await refreshData();
+  STATE.busy = false; STATE.remarksModal = null;
+  render();
+  showToast("Bill marked \u201c"+statusShortLabel(status)+"\u201d.");
+}
 ///////////////////////// EVENTS /////////////////////////
 function bindEvents(){
   document.querySelectorAll('[data-view]').forEach(el=>{
@@ -595,16 +811,43 @@ function bindEvents(){
     }
   });
 
-  document.querySelectorAll('.finance-status-select').forEach(el=>{
-    el.addEventListener('change', async ()=>{
+document.querySelectorAll('.finance-status-select').forEach(el=>{
+    el.addEventListener('change', ()=>{
       const id = el.getAttribute('data-status-bill');
       const newStatus = el.value;
-      await apiPost("updateBillStatus", {billId:id, status:newStatus, remark:""});
-      await refreshData(); render();
-      showToast("Bill marked "+newStatus+".");
+      if(STATUSES_NEEDING_REMARK.includes(newStatus)){
+        // Opening the modal re-renders the page, which redraws this <select> from
+        // STATE.data (still the OLD status) until the remark is actually saved.
+        STATE.remarksModal = {mode:'input', billId:id, status:newStatus};
+        render();
+      } else {
+        applyStatusChange(id, newStatus, "");
+      }
     });
   });
   on('sel-finance-filter','change', e=>{ STATE.dashboardFilter = e.target.value; render(); });
+  on('sel-heads-vertical','change', e=>{ STATE.headsChartVertical = e.target.value; render(); });
+
+  on('remarks-modal-close','click', ()=>{ STATE.remarksModal=null; render(); });
+  on('btn-remark-cancel','click', ()=>{ STATE.remarksModal=null; render(); });
+  on('btn-remark-save','click', async ()=>{
+    const m = STATE.remarksModal;
+    const text = document.getElementById('in-remark-text').value.trim();
+    if(!text){ showToast("Please add a remark before saving.", true); return; }
+    await applyStatusChange(m.billId, m.status, text);
+  });
+  document.querySelectorAll('[data-remark-view]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      STATE.remarksModal = {
+        mode:'view',
+        status: el.getAttribute('data-remark-status'),
+        text: el.getAttribute('data-remark-text'),
+        title: el.getAttribute('data-remark-title')
+      };
+      render();
+    });
+  });
+  on('remarks-modal-bg','click', (e)=>{ if(e.target.id==='remarks-modal-bg'){ STATE.remarksModal=null; render(); } });
 
   document.querySelectorAll('[data-photo-id]').forEach(img=>{
     img.addEventListener('click', ()=>{
